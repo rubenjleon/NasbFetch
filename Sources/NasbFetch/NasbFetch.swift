@@ -19,6 +19,11 @@
 //     Note: Messages strips CSS margins and font sizes, so titles are
 //     bolded and passage/chapter gaps are explicit <br> content.
 //
+// Adjacent passages merge under one heading: the site renders a query
+// like "Exodus 3:15,16" as two separate passages; when one passage
+// directly continues the previous (same book/chapter, next verse) they
+// are combined and the heading rebuilt ("Exodus 3:15,16" / "3:15-17").
+//
 // Parsing is keyed to the site's real markup (verified June 2026):
 //   <p class="Passage__StyledPassageTitle...">Hebrews 6:13-7:28</p>
 //   <span class="verse" data-key=58-007-001>
@@ -27,10 +32,21 @@
 //   </span>
 // data-key is BOOK-CHAPTER-VERSE, which lets us label verses with
 // chapter:verse when a passage spans more than one chapter.
+// MAINTENANCE: if the site redesigns, re-capture a page with
+//   curl -s -A "Mozilla/5.0" "https://nasb.literalword.com/?q=John+3:16" -o page.html
+// and re-verify the StyledPassageTitle / span.verse / data-key selectors.
 
 import Foundation
 import AppKit
 import SwiftSoup
+
+/// Minimal interface both renderers' verse types share, so section
+/// merging can be written once.
+protocol VerseRef {
+    var book: Int { get }
+    var chapter: Int { get }
+    var verse: Int { get }
+}
 
 @main
 struct NasbFetch {
@@ -124,6 +140,68 @@ struct NasbFetch {
         }
     }
 
+    // MARK: - Section merging
+
+    /// Merges a section into the previous one when it directly continues
+    /// it: same book, same chapter, very next verse. The merged heading is
+    /// rebuilt as "Book ch:v,v" with consecutive runs collapsed (15,16 for
+    /// pairs, 15-17 for longer runs). Cross-chapter sections never merge.
+    static func mergeAdjacentSections<V: VerseRef>(
+        _ sections: [(title: String, verses: [V])]
+    ) -> [(title: String, verses: [V])] {
+        var merged: [(title: String, verses: [V])] = []
+
+        for section in sections {
+            if let prev = merged.last,
+               let prevLast = prev.verses.last,
+               let first = section.verses.first,
+               Set(prev.verses.map { $0.chapter }).count == 1,
+               Set(section.verses.map { $0.chapter }).count == 1,
+               first.book == prevLast.book,
+               first.chapter == prevLast.chapter,
+               first.verse == prevLast.verse + 1 {
+
+                let idx = merged.count - 1
+                merged[idx].verses.append(contentsOf: section.verses)
+
+                // Rebuild the heading. The book name is the previous title
+                // minus its final reference token, which stays valid even
+                // after earlier merges ("Exodus 3:15,16" -> "Exodus").
+                let bookName = merged[idx].title
+                    .split(separator: " ").dropLast().joined(separator: " ")
+                if !bookName.isEmpty {
+                    let ch = merged[idx].verses[0].chapter
+                    let runs = collapseVerseRuns(merged[idx].verses.map { $0.verse })
+                    merged[idx].title = "\(bookName) \(ch):\(runs)"
+                }
+            } else {
+                merged.append(section)
+            }
+        }
+        return merged
+    }
+
+    /// [15,16] -> "15,16"   [15,16,17] -> "15-17"   [3,5,6] -> "3,5,6"
+    static func collapseVerseRuns(_ verses: [Int]) -> String {
+        var parts: [String] = []
+        var i = 0
+        while i < verses.count {
+            var j = i
+            while j + 1 < verses.count && verses[j + 1] == verses[j] + 1 { j += 1 }
+            if j == i {
+                parts.append("\(verses[i])")
+            } else if j == i + 1 {
+                parts.append("\(verses[i]),\(verses[j])")
+            } else {
+                parts.append("\(verses[i])-\(verses[j])")
+            }
+            i = j + 1
+        }
+        return parts.joined(separator: ",")
+    }
+
+    // MARK: - Plain / ANSI rendering
+
     /// Walks passage titles and verse spans in document order, so multiple
     /// passages (semicolon-separated queries) come out grouped under their
     /// own headings.
@@ -150,7 +228,8 @@ struct NasbFetch {
             }
         }
 
-        struct VerseItem {
+        struct VerseItem: VerseRef {
+            let book: Int
             let chapter: Int
             let verse: Int
             let text: String
@@ -161,6 +240,7 @@ struct NasbFetch {
             if el.hasClass("verse") {
                 // data-key looks like "58-007-001" -> book-chapter-verse
                 let parts = try el.attr("data-key").split(separator: "-")
+                let book    = parts.count == 3 ? Int(parts[0]) ?? 0 : 0
                 let chapter = parts.count == 3 ? Int(parts[1]) ?? 0 : 0
                 let verse   = parts.count == 3 ? Int(parts[2]) ?? 0 : 0
 
@@ -178,12 +258,14 @@ struct NasbFetch {
                 guard !text.isEmpty else { continue }
 
                 if sections.isEmpty { sections.append(("", [])) }
-                sections[sections.count - 1].verses
-                    .append(VerseItem(chapter: chapter, verse: verse, text: text))
+                sections[sections.count - 1].verses.append(VerseItem(
+                    book: book, chapter: chapter, verse: verse, text: text))
             } else {
                 sections.append((try el.text().trimmingCharacters(in: .whitespaces), []))
             }
         }
+
+        sections = mergeAdjacentSections(sections)
 
         var out: [String] = []
         for section in sections where !section.verses.isEmpty {
@@ -208,6 +290,8 @@ struct NasbFetch {
         return out.joined(separator: "\n")
     }
 
+    // MARK: - Rich-text clipboard rendering
+
     /// Builds styled HTML for the clipboard: serif font, bold small-caps
     /// title, superscript verse numbers, paragraphs at the site's pericope
     /// marks, indented poetry, true italics and small-caps. Pastes into
@@ -219,7 +303,8 @@ struct NasbFetch {
         // whitespace around inline tags.
         _ = doc.outputSettings().prettyPrint(pretty: false)
 
-        struct VerseItem {
+        struct VerseItem: VerseRef {
+            let book: Int
             let chapter: Int
             let verse: Int
             let subhead: String?
@@ -231,6 +316,7 @@ struct NasbFetch {
         for el in try doc.select("[class*=StyledPassageTitle], span.verse").array() {
             if el.hasClass("verse") {
                 let parts = try el.attr("data-key").split(separator: "-")
+                let book    = parts.count == 3 ? Int(parts[0]) ?? 0 : 0
                 let chapter = parts.count == 3 ? Int(parts[1]) ?? 0 : 0
                 let verse   = parts.count == 3 ? Int(parts[2]) ?? 0 : 0
 
@@ -257,12 +343,14 @@ struct NasbFetch {
 
                 if sections.isEmpty { sections.append(("", [])) }
                 sections[sections.count - 1].verses.append(VerseItem(
-                    chapter: chapter, verse: verse, subhead: subhead,
-                    newParagraph: newParagraph, body: body))
+                    book: book, chapter: chapter, verse: verse,
+                    subhead: subhead, newParagraph: newParagraph, body: body))
             } else {
                 sections.append((try el.text().trimmingCharacters(in: .whitespaces), []))
             }
         }
+
+        sections = mergeAdjacentSections(sections)
 
         var out = "<div style=\"font-family: Georgia, 'Times New Roman', serif; font-size:16px; line-height:1.45;\">"
         var firstSection = true
