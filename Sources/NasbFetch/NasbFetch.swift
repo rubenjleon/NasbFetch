@@ -16,6 +16,8 @@
 //     numbers, true italics and small-caps, indented poetry) and puts it
 //     on the clipboard via NSPasteboard, with a plain-text fallback.
 //     Paste into Messages/Notes/Mail for website-like formatting.
+//     Note: Messages strips CSS margins and font sizes, so titles are
+//     bolded and passage/chapter gaps are explicit <br> content.
 //
 // Parsing is keyed to the site's real markup (verified June 2026):
 //   <p class="Passage__StyledPassageTitle...">Hebrews 6:13-7:28</p>
@@ -206,10 +208,11 @@ struct NasbFetch {
         return out.joined(separator: "\n")
     }
 
-    /// Builds styled HTML for the clipboard: serif font, small-caps title,
-    /// superscript verse numbers, paragraphs at the site's pericope marks,
-    /// indented poetry, true italics and small-caps. Pastes into Messages,
-    /// Notes, and Mail looking like the website (minus nav and footer).
+    /// Builds styled HTML for the clipboard: serif font, bold small-caps
+    /// title, superscript verse numbers, paragraphs at the site's pericope
+    /// marks, indented poetry, true italics and small-caps. Pastes into
+    /// Messages, Notes, and Mail looking like the website (minus nav and
+    /// footer).
     static func buildClipboardHTML(from html: String) throws -> String {
         let doc = try SwiftSoup.parse(html)
         // Keep the site's exact spacing: pretty-printing can reflow
@@ -262,12 +265,20 @@ struct NasbFetch {
         }
 
         var out = "<div style=\"font-family: Georgia, 'Times New Roman', serif; font-size:16px; line-height:1.45;\">"
+        var firstSection = true
 
         for section in sections where !section.verses.isEmpty {
+            // Blank line between passages. Messages flattens CSS margins,
+            // so the gap must be explicit content.
+            if !firstSection { out += "<div><br></div>" }
+            firstSection = false
+
             if !section.title.isEmpty {
+                // <b> so the title still stands out in apps (Messages)
+                // that strip font-size and font-variant styling.
                 out += "<div style=\"font-size:1.35em; font-variant:small-caps; "
-                    + "letter-spacing:0.02em; margin:0.6em 0 0.5em 0;\">"
-                    + section.title + "</div>"
+                    + "letter-spacing:0.02em; margin:0.6em 0 0.5em 0;\"><b>"
+                    + section.title + "</b></div>"
             }
 
             let multiChapter = Set(section.verses.map { $0.chapter }).count > 1
@@ -283,8 +294,8 @@ struct NasbFetch {
 
             var lastChapter: Int? = nil
             for v in section.verses {
-                // Blank line before a chapter change mid-passage. Messages
-                // flattens CSS margins, so the gap must be explicit content.
+                // Blank line before a chapter change mid-passage, for the
+                // same margin-stripping reason as above.
                 if let lc = lastChapter, v.chapter != lc {
                     flushParagraph()
                     out += "<div><br></div>"
