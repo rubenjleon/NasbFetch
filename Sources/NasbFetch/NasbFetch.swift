@@ -3,21 +3,26 @@
 // text-message-ready output (headings + verses, no nav links, no footer).
 //
 // Usage:
-//   nasb "Exodus 2:24; 3:15,16; 6:8; 32:13"      print to stdout
-//   nasb -c "Hebrews 6:13-7:28"                  copy RICH TEXT to clipboard
+//   nasb "Hebrews 6:13-7:28"        copy rich text to clipboard (default)
+//   nasb -p "Hebrews 6:13-7:28"     print styled passage in the terminal
+//   nasb "..." | pbcopy              piped: plain text, clipboard untouched
+//   nasb -h                          show help
 //
 // The quotes are required: semicolons are shell command separators.
 //
-// Output modes:
-//   - Terminal: ANSI styling — bold headings, dim verse numbers, italics
-//     for supplied words, UPPERCASE small-caps, indented poetry lines.
-//   - Pipe/redirect (pbcopy, files): plain flowed text, no escape codes.
-//   - -c / --copy: builds styled HTML (serif font, superscript verse
-//     numbers, true italics and small-caps, indented poetry) and puts it
-//     on the clipboard via NSPasteboard, with a plain-text fallback.
-//     Paste into Messages/Notes/Mail for website-like formatting.
-//     Note: Messages strips CSS margins and font sizes, so titles are
-//     bolded and passage/chapter gaps are explicit <br> content.
+// Behavior summary:
+//   - Default (interactive terminal): builds styled HTML (serif font,
+//     bold title, superscript verse numbers, true italics/small-caps,
+//     indented poetry, bold-italic section headings) and puts it on the
+//     clipboard via NSPasteboard with a plain-text fallback. Paste into
+//     Messages/Notes/Mail. Messages strips CSS margins and font sizes,
+//     so titles/subheads carry explicit <b>/<i> and gaps are explicit
+//     <br> content.
+//   - -p / --print: ANSI-styled terminal view — bold headings, dim verse
+//     numbers, italics for supplied words, UPPERCASE small-caps,
+//     indented poetry. Clipboard untouched.
+//   - stdout is a pipe or file: plain flowed text, no escape codes, no
+//     clipboard side effects (safe for scripts and cron).
 //
 // Adjacent passages merge under one heading: the site renders a query
 // like "Exodus 3:15,16" as two separate passages; when one passage
@@ -60,14 +65,47 @@ struct NasbFetch {
         static let italicOff = "\u{1B}[23m"
     }
 
+    static let helpText = """
+        nasb — fetch NASB scripture from nasb.literalword.com
+
+        usage:
+          nasb "Exodus 2:24; 3:15,16; 6:8; 32:13"
+                Copy the passages to the clipboard as rich text.
+                Paste into Messages, Notes, or Mail.
+
+          nasb -p "Hebrews 6:13-7:28"
+                Print the passages in the terminal instead (styled).
+                The clipboard is not touched.
+
+          nasb "John 3:16" > file.txt     (or  | pbcopy, etc.)
+                When output is piped or redirected, plain text is
+                written and the clipboard is not touched.
+
+        options:
+          -p, --print   print to terminal instead of copying
+          -c, --copy    copy to clipboard (this is already the default)
+          -h, --help    show this help
+
+        notes:
+          Quotes around the reference are required — semicolons
+          separate shell commands.
+          References use the site's syntax: "Exodus 2:24; 3:15,16",
+          "Hebrews 6:13-7:28", "Psalm 23", etc.
+        """
+
     static func main() async {
         var args = Array(CommandLine.arguments.dropFirst())
-        let copyToClipboard = args.contains("-c") || args.contains("--copy")
-        args.removeAll { $0 == "-c" || $0 == "--copy" }
+
+        if args.contains("-h") || args.contains("--help") {
+            print(helpText)
+            exit(0)
+        }
+
+        let printMode = args.contains("-p") || args.contains("--print")
+        args.removeAll { ["-p", "--print", "-c", "--copy"].contains($0) }
 
         guard !args.isEmpty else {
-            err("usage: nasb [-c] \"Exodus 2:24; 3:15,16; 6:8; 32:13\"")
-            err("  -c, --copy   copy rich text to clipboard for Messages/Notes/Mail")
+            err(helpText)
             exit(1)
         }
 
@@ -111,7 +149,20 @@ struct NasbFetch {
                 exit(1)
             }
 
-            if copyToClipboard {
+            let interactive = isatty(STDOUT_FILENO) == 1
+
+            if printMode || !interactive {
+                // Print to stdout: styled when a human is looking,
+                // plain when piped/redirected. No clipboard side effects.
+                let passages = try extractPassages(from: html,
+                                                   pretty: interactive)
+                guard !passages.isEmpty else {
+                    err("warning: no passages found — check the reference, or the site layout may have changed")
+                    exit(1)
+                }
+                print(passages)
+            } else {
+                // Default: copy rich text to the clipboard.
                 let richHtml = try buildClipboardHTML(from: html)
                 let plain = try extractPassages(from: html, pretty: false)
                 guard !plain.isEmpty else {
@@ -123,16 +174,7 @@ struct NasbFetch {
                 pb.declareTypes([.html, .string], owner: nil)
                 pb.setString(richHtml, forType: .html)
                 pb.setString(plain, forType: .string)
-                print("Copied \(query) to clipboard as rich text — paste into Messages, Notes, or Mail.")
-            } else {
-                // Pretty output only when a human is looking at it.
-                let pretty = isatty(STDOUT_FILENO) == 1
-                let passages = try extractPassages(from: html, pretty: pretty)
-                guard !passages.isEmpty else {
-                    err("warning: no passages found — check the reference, or the site layout may have changed")
-                    exit(1)
-                }
-                print(passages)
+                print("Copied \(query) to clipboard — paste into Messages, Notes, or Mail. (nasb -h for help)")
             }
         } catch {
             err("error: \(error.localizedDescription)")
